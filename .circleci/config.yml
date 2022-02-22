@@ -128,7 +128,7 @@ jobs:
           name: "anchor test"
           command: |
             export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
-            anchor test
+            anchor test --provider.cluster localnet
       
       - save_cache:
           key: cache-key-bpf-dep
