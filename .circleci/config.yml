@@ -1,0 +1,190 @@
+version: 2.1
+
+commands:
+  setup:
+    steps:
+    - checkout
+
+    - run:
+        name: "setup vars"
+        command: |
+          PROGRAM_NAME="anchor_crunchy_vs_smooth"
+          PROGRAM_PATH="./target/deploy/$PROGRAM_NAME.so"
+
+          echo 'export PROGRAM_NAME="'$PROGRAM_NAME'"' >> $BASH_ENV
+          echo 'export PROGRAM_PATH="'$PROGRAM_PATH'"' >> $BASH_ENV
+
+    - run:
+        name: "setup ci anchor.toml"
+        command: |
+          rm Anchor.toml
+          mv Anchor-ci.toml Anchor.toml
+    
+    - run:
+        name: "write keypair"
+        command: | 
+          mkdir target
+          mkdir target/deploy
+          printf "$PROGRAM_KEYPAIR" > ./target/deploy/$PROGRAM_NAME-keypair.json
+
+    - restore_cache:
+        key: cache-key-solana-cli
+
+    - run:
+        name: "install solana"
+        command: |
+          FILE=/home/circleci/.local/share/solana/install/active_release/bin/solana
+          if test -f "$FILE"; then
+            echo "solana cli is installed"
+          else
+            echo "installing solana cli"
+            sh -c "$(curl -sSfL https://release.solana.com/v1.9.6/install)"
+          fi 
+    
+    - save_cache:
+        key: cache-key-solana-cli
+        paths: 
+          - /home/circleci/.local/share/solana
+
+    - run: 
+        name: "create file system wallet"
+        command: |
+          export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+          echo 'export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"' >> $BASH_ENV
+          solana config set --url devnet
+          printf "$OWNER_KEYPAIR" > /home/circleci/.config/solana/id.json 
+          solana config get
+
+    - run:
+        name: "fund wallet"
+        command: |
+          export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+          
+          solana config set --url devnet
+          
+          BALANCE=$(solana balance | tr -dc '0-9') 
+          if [ "$BALANCE" -lt 1 ]; then
+            solana airdrop 1
+          fi  
+    
+    - run:
+        name: "export program id"
+        command: |
+          export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+          
+          PROGRAM_ID=$(solana address -k ./target/deploy/$PROGRAM_NAME-keypair.json)
+          
+          echo 'export PROGRAM_ID="'$PROGRAM_ID'"' >> $BASH_ENV
+
+          echo "the program id is" $PROGRAM_ID
+    
+    - run:
+        name: "yarn"
+        command: |
+          sudo yarn
+    
+    - run:
+        name: "install anchor cli"
+        command: "sudo npm i -g @project-serum/anchor-cli"
+
+
+jobs:
+  build:
+    docker:
+      - image: cimg/rust:1.58.1-node 
+    steps:
+      - setup
+      
+      - restore_cache:
+          key: v1-build-{{ checksum "programs/<Your App Name>/src/lib.rs" }}
+      
+      - run:
+          command: |
+            export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+
+            if test -f "$PROGRAM_PATH"; then
+              echo "build exists"
+            else
+              echo "new build"
+              anchor build
+            fi 
+
+      - save_cache:
+          key: v1-build-{{ checksum "programs/$PROGRAM_NAME/src/lib.rs" }}
+          paths: 
+            - target/deploy   
+
+
+  test:
+    docker:
+      - image: cimg/rust:1.58.1-node 
+    steps:
+      - setup
+
+      - restore_cache:
+          key: cache-key-bpf-dep
+
+      - run:
+          name: "anchor test"
+          command: |
+            export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+            anchor test
+      
+      - save_cache:
+          key: cache-key-bpf-dep
+          paths: 
+            - /home/circleci/.local/share/solana
+
+  deploy:
+    docker:
+      - image: cimg/rust:1.58.1-node 
+    steps:
+      - setup
+
+      - restore_cache:
+          key: cache-key-bpf-dep    
+
+      - run: 
+          name: "fresh build"
+          command: |
+            export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+
+            anchor build --provider.cluster devnet
+      
+      - run:
+          name: "deploy to devnet"
+          command: |
+            export PATH="/home/circleci/.local/share/solana/install/active_release/bin:$PATH"
+            
+            if (solana program show $PROGRAM_ID)
+            then
+              echo 'program exists on chain upgrading program'
+              echo "program id" ${PROGRAM_ID}
+              anchor upgrade --provider.cluster devnet --program-id ${PROGRAM_ID} ${PROGRAM_PATH}
+            else
+              echo 'program does not exists on chain deploying new program'
+              anchor deploy --provider.cluster devnet
+            fi
+    
+
+workflows:
+  branch:
+    jobs:
+      - test:
+          filters:
+            branches:
+              ignore: main
+      
+  staging:
+    jobs:
+      - test:
+          filters:
+            branches:
+              only: main
+      - deploy:
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+
